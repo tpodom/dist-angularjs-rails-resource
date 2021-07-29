@@ -1,6 +1,6 @@
 /**
  * A resource factory inspired by $resource from AngularJS
- * @version v1.1.1 - 2014-04-12
+ * @version v2.3.1 - 2021-07-26
  * @link https://github.com/FineLinePrototyping/angularjs-rails-resource.git
  * @author 
  */
@@ -143,7 +143,7 @@
                 return url;
             }
 
-            if (url.indexOf($interpolate.startSymbol()) === -1) {
+            if (!config.singular && url.indexOf($interpolate.startSymbol()) === -1) {
                 url = url + '/' + $interpolate.startSymbol() + idAttribute + $interpolate.endSymbol();
             }
 
@@ -242,6 +242,7 @@
                     this.preservedAttributes = {};
                     this.customSerializers = {};
                     this.nestedResources = {};
+                    this.polymorphics = {};
                     this.options = angular.extend({excludeByDefault: false}, defaultOptions, options || {});
 
                     if (customizer) {
@@ -319,6 +320,25 @@
                     if (serializer) {
                         this.serializeWith(attributeName, serializer);
                     }
+
+                    return this;
+                };
+
+                /**
+                 * Specifies a polymorphic association according to Rails' standards.
+                 * Polymorphic associations have a <code>{name}_id</code> and <code>{name}_type</code> columns in the database.
+                 *
+                 * The <code>{name}_type</code> attribute will specify which resource will be used to serialize and deserialize the data.
+                 *
+                 * @param names... {string} Variable number of name parameters
+                 * @returns {Serializer} this for chaining support
+                 */
+                Serializer.prototype.polymorphic = function () {
+                    var polymorphics = this.polymorphics;
+
+                    angular.forEach(arguments, function(attributeName) {
+                        polymorphics[attributeName] = true;
+                    });
 
                     return this;
                 };
@@ -481,10 +501,17 @@
                 /**
                  * Returns a reference to the nested resource that has been specified for the attribute.
                  * @param attributeName The attribute name
+                 * @param data the entire object being serialized
                  * @returns {*} undefined if no nested resource has been specified or a reference to the nested resource class
                  */
-                Serializer.prototype.getNestedResource = function (attributeName) {
-                    return RailsResourceInjector.getDependency(this.nestedResources[attributeName]);
+                Serializer.prototype.getNestedResource = function (attributeName, data) {
+                    var resourceName;
+                    if (!this.polymorphics[attributeName]) {
+                        resourceName = this.nestedResources[attributeName];
+                    } else {
+                        resourceName = data[attributeName + '_type'];
+                    }
+                    return RailsResourceInjector.getDependency(resourceName);
                 };
 
                 /**
@@ -494,10 +521,11 @@
                  * is used.  Custom serializers specified using serializeWith take precedence over the nested resource serializer.
                  *
                  * @param attributeName The attribute name
+                 * @param data the entire object being serialized
                  * @returns {*} undefined if no custom serializer has been specified or an instance of the Serializer
                  */
-                Serializer.prototype.getAttributeSerializer = function (attributeName) {
-                    var resource = this.getNestedResource(attributeName),
+                Serializer.prototype.getAttributeSerializer = function (attributeName, data) {
+                    var resource = this.getNestedResource(attributeName, data),
                         serializer = this.customSerializers[attributeName];
 
                     // custom serializer takes precedence over resource serializer
@@ -517,7 +545,7 @@
                  * @param data The data to prepare
                  * @returns {*} A new object or array that is ready for JSON serialization
                  */
-                Serializer.prototype.serializeValue = function (data) {
+                Serializer.prototype.serializeData = function (data) {
                     var result = data,
                         self = this;
 
@@ -525,7 +553,7 @@
                         result = [];
 
                         angular.forEach(data, function (value) {
-                            result.push(self.serializeValue(value));
+                            result.push(self.serializeData(value));
                         });
                     } else if (angular.isObject(data)) {
                         if (angular.isDate(data)) {
@@ -533,27 +561,37 @@
                         }
                         result = {};
 
-                        angular.forEach(data, function (value, key) {
-                            // if the value is a function then it can't be serialized to JSON so we'll just skip it
-                            if (!angular.isFunction(value)) {
-                                self.serializeAttribute(result, key, value);
-                            }
-                        });
+                        this.serializeObject(result, data);
+
                     }
 
                     return result;
+                };
+
+                Serializer.prototype.serializeObject = function(result, data) {
+
+
+                    var tthis = this;
+                    angular.forEach(data, function (value, key) {
+                        // if the value is a function then it can't be serialized to JSON so we'll just skip it
+                        if (!angular.isFunction(value)) {
+                            tthis.serializeAttribute(result, key, value, data);
+                        }
+                    });
+                    return data;
                 };
 
                 /**
                  * Transforms an attribute and its value and stores it on the parent data object.  The attribute will be
                  * renamed as needed and the value itself will be serialized as well.
                  *
-                 * @param data The object that the attribute will be added to
+                 * @param result The object that the attribute will be added to
                  * @param attribute The attribute to transform
                  * @param value The current value of the attribute
+                 * @param data the entire object being serialized
                  */
-                Serializer.prototype.serializeAttribute = function (data, attribute, value) {
-                    var serializer = this.getAttributeSerializer(attribute),
+                Serializer.prototype.serializeAttribute = function (result, attribute, value, data) {
+                    var serializer = this.getAttributeSerializer(attribute, data),
                         serializedAttributeName = this.getSerializedAttributeName(attribute);
 
                     // undefined means the attribute should be excluded from serialization
@@ -561,7 +599,7 @@
                         return;
                     }
 
-                    data[serializedAttributeName] = serializer ? serializer.serialize(value) : this.serializeValue(value);
+                    result[serializedAttributeName] = serializer ? serializer.serialize(value) : this.serializeData(value);
                 };
 
                 /**
@@ -575,18 +613,31 @@
                  * @returns {*} A new object or array that is ready for JSON serialization
                  */
                 Serializer.prototype.serialize = function (data) {
-                    var result = this.serializeValue(data),
+                    var result = angular.copy(data),
                         self = this;
 
                     if (angular.isObject(result)) {
                         angular.forEach(this.customSerializedAttributes, function (value, key) {
-                            if (angular.isFunction(value)) {
-                                value = value.call(data, data);
-                            }
+                            if (angular.isArray(result)) {
+                                angular.forEach(result, function (item, index) {
+                                    var itemValue = value;
+                                    if (angular.isFunction(value)) {
+                                        itemValue = itemValue.call(item, item);
+                                    }
 
-                            self.serializeAttribute(result, key, value);
+                                    self.serializeAttribute(item, key, itemValue, data);
+                                });
+                            } else {
+                                if (angular.isFunction(value)) {
+                                    value = value.call(data, data);
+                                }
+
+                                self.serializeAttribute(result, key, value, data);
+                            }
                         });
                     }
+
+                    result = this.serializeData(result);
 
                     return result;
                 };
@@ -596,9 +647,10 @@
                  *
                  * @param data The object to deserialize
                  * @param Resource (optional) The resource type to deserialize the result into
+                 * @param triggerPhase (optional) Whether to trigger the afterDeserialize phase
                  * @returns {*} A new object or an instance of Resource populated with deserialized data.
                  */
-                Serializer.prototype.deserializeValue = function (data, Resource) {
+                Serializer.prototype.deserializeData = function (data, Resource, triggerPhase) {
                     var result = data,
                         self = this;
 
@@ -606,36 +658,49 @@
                         result = [];
 
                         angular.forEach(data, function (value) {
-                            result.push(self.deserializeValue(value, Resource));
+                            result.push(self.deserializeData(value, Resource, triggerPhase));
                         });
                     } else if (angular.isObject(data)) {
                         if (angular.isDate(data)) {
                             return data;
                         }
-
                         result = {};
 
                         if (Resource) {
                             result = new Resource.config.resourceConstructor();
                         }
 
-                        angular.forEach(data, function (value, key) {
-                            self.deserializeAttribute(result, key, value);
-                        });
+                        this.deserializeObject(result, data, triggerPhase);
+
                     }
 
                     return result;
                 };
 
+                Serializer.prototype.deserializeObject = function (result, data, triggerPhase) {
+
+                    var tthis = this;
+                    angular.forEach(data, function (value, key) {
+                        tthis.deserializeAttribute(result, key, value, data);
+                    });
+                    if (triggerPhase && result.constructor.runInterceptorPhase) {
+                        result.constructor.runInterceptorPhase('afterDeserialize', result);
+                    }
+
+                    return data;
+                };
+
+
                 /**
                  * Transforms an attribute and its value and stores it on the parent data object.  The attribute will be
                  * renamed as needed and the value itself will be deserialized as well.
                  *
-                 * @param data The object that the attribute will be added to
+                 * @param result The object that the attribute will be added to
                  * @param attribute The attribute to transform
                  * @param value The current value of the attribute
+                 * @param data the entire object being deserialized
                  */
-                Serializer.prototype.deserializeAttribute = function (data, attribute, value) {
+                Serializer.prototype.deserializeAttribute = function (result, attribute, value, data) {
                     var serializer,
                         NestedResource,
                         attributeName = this.getDeserializedAttributeName(attribute);
@@ -645,14 +710,14 @@
                         return;
                     }
 
-                    serializer = this.getAttributeSerializer(attributeName);
-                    NestedResource = this.getNestedResource(attributeName);
+                    serializer = this.getAttributeSerializer(attributeName, data);
+                    NestedResource = this.getNestedResource(attributeName, data);
 
                     // preserved attributes are assigned unmodified
                     if (this.preservedAttributes[attributeName]) {
-                        data[attributeName] = value;
+                        result[attributeName] = value;
                     } else {
-                        data[attributeName] = serializer ? serializer.deserialize(value, NestedResource) : this.deserializeValue(value, NestedResource);
+                        result[attributeName] = serializer ? serializer.deserialize(value, NestedResource, true) : this.deserializeData(value, NestedResource, true);
                     }
                 };
 
@@ -665,11 +730,12 @@
                  *
                  * @param data The object to deserialize
                  * @param Resource (optional) The resource type to deserialize the result into
+                 * @param triggerPhase (optional) Whether to trigger the afterDeserialize phase
                  * @returns {*} A new object or an instance of Resource populated with deserialized data
                  */
-                Serializer.prototype.deserialize = function (data, Resource) {
+                Serializer.prototype.deserialize = function (data, Resource, triggerPhase) {
                     // just calls deserializeValue for now so we can more easily add on custom attribute logic for deserialize too
-                    return this.deserializeValue(data, Resource);
+                    return this.deserializeData(data, Resource, triggerPhase);
                 };
 
                 Serializer.prototype.pluralize = function (value) {
@@ -710,10 +776,10 @@
                 result[angular.isArray(data) ? resource.config.pluralName : resource.config.name] = data;
                 return result;
             },
-            unwrap: function (response, resource) {
+            unwrap: function (response, resource, isObject) {
                 if (response.data && response.data.hasOwnProperty(resource.config.name)) {
                     response.data = response.data[resource.config.name];
-                } else if (response.data && response.data.hasOwnProperty(resource.config.pluralName)) {
+                } else if (response.data && response.data.hasOwnProperty(resource.config.pluralName) && !isObject) {
                     response.data = response.data[resource.config.pluralName];
                 }
 
@@ -730,6 +796,7 @@
             defaultParams: undefined,
             underscoreParams: true,
             fullResponse: false,
+            singular: false,
             extensions: []
         };
 
@@ -811,16 +878,17 @@
             return this;
         };
 
-        this.$get = ['$http', '$q', 'railsUrlBuilder', 'railsSerializer', 'railsRootWrapper', 'RailsResourceInjector',
-            function ($http, $q, railsUrlBuilder, railsSerializer, railsRootWrapper, RailsResourceInjector) {
+        this.$get = ['$http', '$q', '$timeout', 'railsUrlBuilder', 'railsSerializer', 'railsRootWrapper', 'RailsResourceInjector',
+            function ($http, $q, $timeout, railsUrlBuilder, railsSerializer, railsRootWrapper, RailsResourceInjector) {
 
                 function RailsResource(value) {
                     if (value) {
                         var response = this.constructor.deserialize({data: value});
                         if (this.constructor.config.rootWrapping) {
-                            response = railsRootWrapper.unwrap(response, this.constructor);
+                            response = railsRootWrapper.unwrap(response, this.constructor, true);
                         }
                         angular.extend(this, response.data);
+                        this.constructor.runInterceptorPhase('afterDeserialize', this);
                     }
                 }
 
@@ -922,6 +990,7 @@
                     this.config.underscoreParams = booleanParam(cfg.underscoreParams, defaultOptions.underscoreParams);
                     this.config.updateMethod = (cfg.updateMethod || defaultOptions.updateMethod).toLowerCase();
                     this.config.fullResponse = booleanParam(cfg.fullResponse, defaultOptions.fullResponse);
+                    this.config.singular = cfg.singular || defaultOptions.singular;
 
                     this.config.requestTransformers = cfg.requestTransformers ? cfg.requestTransformers.slice(0) : [];
                     this.config.responseInterceptors = cfg.responseInterceptors ? cfg.responseInterceptors.slice(0) : [];
@@ -947,6 +1016,8 @@
                             mixin.configure(this.config, cfg);
                         }
                     }, this);
+
+                    return this.config;
                 };
 
                 /**
@@ -1014,6 +1085,12 @@
                  * * afterResponseError: Interceptors get called when a previous interceptor threw an error or
                  *      resolved with a rejection.
                  *
+                 * Finally, for each deserialized resource including associations, deserialization phases are called.
+                 *
+                 * The valid deserialization phases are:
+                 *
+                 * * afterDeserialize: Interceptors are called after a resource has been deserialized.
+                 *
                  * @param {String | Object} interceptor
                  */
                 RailsResource.addInterceptor = function (interceptor) {
@@ -1023,7 +1100,7 @@
                 /**
                  * Adds an interceptor callback function for the specified phase.
                  * @param {String} phase The interceptor phase, one of:
-                 *      beforeRequest, request, beforeResponse, response, afterResponse
+                 *      beforeRequest, request, beforeResponse, response, afterResponse, afterDeserialize
                  * @param fn The function to call.
                  */
                 RailsResource.intercept = function (phase, fn) {
@@ -1105,6 +1182,16 @@
                  */
                 RailsResource.interceptAfterResponse = function (fn) {
                     this.intercept('afterResponse', fn);
+                };
+
+                /**
+                 * Adds interceptor on 'afterDeserialize' phase.
+                 * @param fn(response data, constructor, context) - response data is either the resource instance returned or an array of resource instances,
+                 *      constructor is the resource class calling the function,
+                 *      context is the resource instance of the calling method (create, update, delete) or undefined if the method was a class method (get, query)
+                 */
+                RailsResource.interceptAfterDeserialize = function (fn) {
+                    this.intercept('afterDeserialize', fn);
                 };
 
                 /**
@@ -1206,6 +1293,7 @@
                 };
 
                 RailsResource.runInterceptorPhase = function (phase, context, promise) {
+                    promise = promise || $q.resolve(context);
                     var config = this.config, chain = [];
 
                     forEachDependency(config.interceptors, function (interceptor) {
@@ -1243,34 +1331,66 @@
                  *      has completed.
                  */
                 RailsResource.$http = function (httpConfig, context, resourceConfigOverrides) {
-                    var config = angular.extend(angular.copy(this.config), resourceConfigOverrides || {}),
+                    var timeoutPromise, promise,
+                        config = angular.extend(angular.copy(this.config), resourceConfigOverrides || {}),
                         resourceConstructor = config.resourceConstructor,
-                        promise = $q.when(httpConfig);
+                        abortDeferred = $q.defer();
 
-                    promise = this.runInterceptorPhase('beforeRequest', context, promise).then(function (httpConfig) {
-                        httpConfig = resourceConstructor.serialize(httpConfig);
-
-                        forEachDependency(config.requestTransformers, function (transformer) {
-                            httpConfig.data = transformer(httpConfig.data, config.resourceConstructor);
-                        });
-
-                        return httpConfig;
-                    });
-
-                    promise = this.runInterceptorPhase('beforeRequestWrapping', context, promise);
-
-                    if (config.rootWrapping) {
-                        promise = promise.then(function (httpConfig) {
-                            httpConfig.data = railsRootWrapper.wrap(httpConfig.data, config.resourceConstructor);
-                            return httpConfig;
-                        });
+                    function abortRequest() {
+                        abortDeferred.resolve();
                     }
 
-                    promise = this.runInterceptorPhase('request', context, promise).then(function (httpConfig) {
-                        return $http(httpConfig);
-                    });
+                    if (httpConfig && httpConfig.timeout) {
+                        if (httpConfig.timeout > 0) {
+                            timeoutPromise = $timeout(abortDeferred.resolve, httpConfig.timeout);
+                        } else if (angular.isFunction(httpConfig.timeout.then)) {
+                            httpConfig.timeout.then(abortDeferred.resolve);
+                        }
+                    }
 
-                    promise = this.runInterceptorPhase('beforeResponse', context, promise);
+                    httpConfig = angular.extend({}, httpConfig, {timeout: abortDeferred.promise});
+                    promise = $q.when(httpConfig);
+
+                    if (!config.skipRequestProcessing) {
+
+                        promise = this.runInterceptorPhase('beforeRequest', context, promise).then(function (httpConfig) {
+                            httpConfig = resourceConstructor.serialize(httpConfig);
+
+                            forEachDependency(config.requestTransformers, function (transformer) {
+                                httpConfig.data = transformer(httpConfig.data, config.resourceConstructor);
+                            });
+
+                            return httpConfig;
+                        });
+
+                        promise = this.runInterceptorPhase('beforeRequestWrapping', context, promise);
+
+                        if (config.rootWrapping) {
+                            promise = promise.then(function (httpConfig) {
+                                httpConfig.data = railsRootWrapper.wrap(httpConfig.data, config.resourceConstructor);
+                                return httpConfig;
+                            });
+                        }
+
+                        promise = this.runInterceptorPhase('request', context, promise).then(function (httpConfig) {
+                            return $http(httpConfig);
+                        });
+
+                    } else {
+                        promise = $http(httpConfig);
+                    }
+
+                    // After the request has completed we need to cancel any pending timeout
+                    if (timeoutPromise) {
+                        // not using finally here to stay compatible with angular 1.0
+                        promise = promise.then(function (result) {
+                            $timeout.cancel(timeoutPromise);
+                            return result;
+                        }, function (error) {
+                            $timeout.cancel(timeoutPromise);
+                            return $q.reject(error);
+                        });
+                    }
 
                     promise = this.runInterceptorPhase('beforeResponse', context, promise).then(function (response) {
                       // store off the data so we don't lose access to it after deserializing and unwrapping
@@ -1280,7 +1400,7 @@
 
                     if (config.rootWrapping) {
                         promise = promise.then(function (response) {
-                            return railsRootWrapper.unwrap(response, config.resourceConstructor);
+                            return railsRootWrapper.unwrap(response, config.resourceConstructor, false);
                         });
                     }
 
@@ -1302,9 +1422,12 @@
 
                     promise = this.callAfterResponseInterceptors(promise, context);
                     promise = this.runInterceptorPhase('afterResponse', context, promise);
-                    promise.resource = config.resourceConstructor;
-                    promise.context = context;
-                    return promise;
+                    promise = this.runInterceptorPhase('afterDeserialize', context, promise);
+                    return extendPromise(promise, {
+                        resource: config.resourceConstructor,
+                        context: context,
+                        abort: abortRequest
+                    });
                 };
 
                 /**
@@ -1369,13 +1492,15 @@
                  * @param path {string} (optional) An additional path to append to the URL
                  * @return {string}
                  */
-                RailsResource.$url = RailsResource.resourceUrl = function (context, path) {
-                    if (!angular.isObject(context)) {
-                        context = {id: context};
-                    }
+                 RailsResource.$url = RailsResource.resourceUrl = function (ctxt, path) {
+                     var context = ctxt;
+                     if (!angular.isObject(ctxt)) {
+                         context = {};
+                         context[this.config.idAttribute] = ctxt;
+                     }
 
-                    return appendPath(this.buildUrl(context || {}), path);
-                };
+                     return appendPath(this.buildUrl(context || {}), path);
+                 };
 
                 RailsResource.$get = function (url, queryParams) {
                     return this.$http(angular.extend({method: 'get', url: url}, this.getHttpConfig(queryParams)));
@@ -1415,17 +1540,16 @@
                 };
 
                 angular.forEach(['post', 'put', 'patch'], function (method) {
-                    RailsResource['$' + method] = function (url, data) {
+                    RailsResource['$' + method] = function (url, data, resourceConfigOverrides, queryParams) {
                         // clone so we can manipulate w/o modifying the actual instance
                         data = angular.copy(data);
-                        return this.$http(angular.extend({method: method, url: url, data: data}, this.getHttpConfig()));
+                        return this.$http(angular.extend({method: method, url: url, data: data}, this.getHttpConfig(queryParams)), null, resourceConfigOverrides);
                     };
 
-                    RailsResource.prototype['$' + method] = function (url) {
+                    RailsResource.prototype['$' + method] = function (url, context, queryParams) {
                         // clone so we can manipulate w/o modifying the actual instance
                         var data = angular.copy(this, {});
-                        return this.constructor.$http(angular.extend({method: method, url: url, data: data}, this.constructor.getHttpConfig()), this);
-
+                        return this.constructor.$http(angular.extend({method: method, url: url, data: data}, this.constructor.getHttpConfig(queryParams)), this);
                     };
                 });
 
@@ -1549,6 +1673,16 @@
                         // can't use identity because we need to return a rejected promise to keep the error chain going
                         return rejectFn ? rejectFn(rejection, resourceConstructor, context) : $q.reject(rejection);
                     };
+                }
+
+                function extendPromise(promise, attributes) {
+                    var oldThen = promise.then;
+                    promise.then = function (onFulfilled, onRejected, progressBack) {
+                        var chainedPromise = oldThen.apply(this, arguments);
+                        return extendPromise(chainedPromise, attributes);
+                    };
+                    angular.extend(promise, attributes);
+                    return promise;
                 }
             }];
     });

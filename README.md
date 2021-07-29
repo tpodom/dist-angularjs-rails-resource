@@ -1,7 +1,7 @@
 # bower-angularjs-rails-resource
 
 This repo is for distribution on `bower`. The source for this module is in the
-[main AngularJS Rails Resource repo](https://github.com/FineLinePrototyping/angularjs-rails-resource).
+[main AngularJS Rails Resource repo](https://github.com/tpodom/angularjs-rails-resource).
 Please file issues and pull requests against that repo.
 
 ## Install

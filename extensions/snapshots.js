@@ -9,40 +9,53 @@
 
         RailsResourceSnapshotsMixin.extended = function (Resource) {
             Resource.intercept('afterResponse', function (result, resource, context) {
-                if (context && context.hasOwnProperty('$snapshots') && angular.isArray(context.$snapshots)) {
-                    context.$snapshots.length = 0;
+                if (context && context.hasOwnProperty('$$snapshots') && angular.isArray(context.$$snapshots)) {
+                    context.$$snapshots.length = 0;
                 }
             });
 
             Resource.include({
                 snapshot: snapshot,
                 rollback: rollback,
-                rollbackTo: rollbackTo
+                rollbackTo: rollbackTo,
+                unsnappedChanges: unsnappedChanges,
+                _prepSnapshot: _prepSnapshot
             });
         };
 
         return RailsResourceSnapshotsMixin;
 
         /**
-         * Stores a copy of this resource in the $snapshots array to allow undoing changes.
-         * @param {function} rollbackCallback Optional callback function to be executed after the rollback.
-         * @returns {Number} The version of the snapshot created (0-based index)
+         * Prepares a copy of the resource to be stored as a snapshot
+         * @returns {Resource} the copied resource, sans $$snapshots
          */
-        function snapshot(rollbackCallback) {
+        function _prepSnapshot() {
             var config = this.constructor.config,
                 copy = (config.snapshotSerializer || config.serializer).serialize(this);
 
             // we don't want to store our snapshots in the snapshots because that would make the rollback kind of funny
             // not to mention using more memory for each snapshot.
-            delete copy.$snapshots;
+            delete copy.$$snapshots;
+
+            return copy
+        }
+
+        /**
+         * Stores a copy of this resource in the $$snapshots array to allow undoing changes.
+         * @param {function} rollbackCallback Optional callback function to be executed after the rollback.
+         * @returns {Number} The version of the snapshot created (0-based index)
+         */
+        function snapshot(rollbackCallback) {
+            var copy = this._prepSnapshot();
+
             copy.$rollbackCallback = rollbackCallback;
 
-            if (!this.$snapshots) {
-                this.$snapshots = [];
+            if (!this.$$snapshots) {
+                this.$$snapshots = [];
             }
 
-            this.$snapshots.push(copy);
-            return this.$snapshots.length - 1;
+            this.$$snapshots.push(copy);
+            return this.$$snapshots.length - 1;
         }
 
         /**
@@ -63,8 +76,8 @@
         function rollbackTo(version) {
             var versions, rollbackCallback,
                 config = this.constructor.config,
-                snapshots = this.$snapshots,
-                snapshotsLength = this.$snapshots ? this.$snapshots.length : 0;
+                snapshots = this.$$snapshots,
+                snapshotsLength = this.$$snapshots ? this.$$snapshots.length : 0;
 
             // if an invalid snapshot version was specified then don't attempt to do anything
             if (!angular.isArray(snapshots) || snapshotsLength === 0 || !angular.isNumber(version)) {
@@ -81,7 +94,7 @@
             angular.extend(this, (config.snapshotSerializer || config.serializer).deserialize(versions[0]));
 
             // restore special variables
-            this.$snapshots = snapshots;
+            this.$$snapshots = snapshots;
             delete this.$rollbackCallback;
 
             if (angular.isFunction(rollbackCallback)) {
@@ -102,7 +115,7 @@
          * @returns {Boolean} true if rollback was successful, false otherwise
          */
         function rollback(numVersions) {
-            var snapshotsLength = this.$snapshots ? this.$snapshots.length : 0;
+            var snapshotsLength = this.$$snapshots ? this.$$snapshots.length : 0;
             numVersions = Math.min(numVersions || 1, snapshotsLength);
 
             if (numVersions < 0) {
@@ -110,10 +123,25 @@
             }
 
             if (snapshotsLength) {
-                this.rollbackTo(this.$snapshots.length - numVersions);
+                this.rollbackTo(this.$$snapshots.length - numVersions);
             }
 
             return true;
+        }
+
+        /**
+         * Checks if resource is changed from the most recent snapshot.
+         * @returns {Boolean} true if the latest snapshot differs from resource as-is
+         */
+        function unsnappedChanges() {
+            if (!this.$$snapshots) {
+                return true
+            }
+
+            var copy = this._prepSnapshot(),
+                latestSnap = this.$$snapshots[this.$$snapshots.length - 1]
+
+            return !angular.equals(copy, latestSnap)
         }
 
     }]);
